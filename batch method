@@ -1,0 +1,206 @@
+import os
+from typing import Dict
+from threading import Thread
+from transformers import AutoTokenizer
+from optimum.rbln import BatchTextIteratorStreamer, RBLNLlamaForCausalLM
+import time
+#import click
+
+# 모델을 컴파일하고 내보내기
+model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
+model_save_dir = "rbln-Llama-3-8B-Instruct"
+# model_id = "meta-llama/Llama-2-7b-chat-hf"
+
+
+def get_or_compile_model(
+    model_save_dir_prefix: str,
+    model_id: str,
+    batch_size: int,
+    max_seq_len: int,
+    tp: int = 4,
+):
+    model_save_dir = f"{model_save_dir_prefix}.model_id={model_id}.batch_size={batch_size}.max_seq_len={max_seq_len}"
+
+    # 파일이 존재하면 load, 아니면 컴파일 후 로드
+    if not os.path.exists(model_save_dir):  # 존재하지 않으므로 컴파일먼저
+        compiled_model = RBLNLlamaForCausalLM.from_pretrained(
+            model_id=model_id,
+            export=True,
+            rbln_batch_size=batch_size,  # 배치 크기 설정 (여러 개 입력을 동시에 처리)
+            rbln_max_seq_len=max_seq_len,  # default max_positional_embeddings
+            rbln_tensor_parallel_size=tp,  # using multiple NPUs
+        )
+        # 컴파일된 모델을 디스크에 저장
+        compiled_model.save_pretrained(model_save_dir)
+
+    # 컴파일된 모델 로드
+    compiled_model = RBLNLlamaForCausalLM.from_pretrained(
+        model_id=model_save_dir,
+        export=False,
+    )
+
+    return compiled_model
+
+
+if __name__ == "__main__":
+    # input 준비
+    tokenizer = AutoTokenizer.from_pretrained(model_id, padding_side="left")
+    tokenizer.pad_token = tokenizer.eos_token
+
+    # BOS (Beginning Of Sequence)
+    # EOS (End of Sequence) -> 예가 생성이 되면 생성중단
+
+    # 여러 개의 대화를 배치로 처리할 수 있도록 준비
+    conversation = [
+        [
+            { #요청 전처리 단계. LLM이 은행 업무를 제공하면서 유도 질문을 진행 및 대화 요약. 
+                "role": "system", 
+                "content": (
+                    "처음부터 끝까지 일관되게 한국어로 대답해줘."
+                    "너가 훌륭한 은행 직원이라 가정해보자. 너는 은행 업무를 수행하면서도 스몰토크를 진행하면서 사용자의 인적관계에 대한 정보를 얻어야돼."
+                    """예를 들어 
+                    "안녕하세요! 오늘 어떻게 지내셨나요?"
+                    "요즘 날씨가 많이 쌀쌀해졌죠. 건강은 괜찮으신가요?"
+                    등의 토크를 건내면서 다른 가족들의 근황을 물어보거나 송금하려는 대상의 정보를 얻을 수 있는 질문을 해야 돼."""
+                    """은행 업무를 수행하면서 만약 보이스피싱이 의심될 때, 
+                    "혹시 자녀분들은 다들 어떻게 지내시나요?"
+                    "오늘은 무슨 일로 은행에 오셨나요? 혹시 특별한 거래나 송금이 있으신가요?"
+                    "최근에 자녀분들 혹은 지인분들께 갑작스런 송금 요청을 받으신 적 있으세요?"
+                    "요즘 전화나 메세지로 계좌 관련 안내를 받으신 적 있나요?"
+                    등의 상황별 질문을 건내면서 너와 사용자와의 대화를 누가/ 무엇을/ 어떻게 라는 관계식으로 요약해줘."""
+                )
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    "안녕하세요! 서휘님의 금융비서 은행봇입니다! 오늘은 어떤 업무를 도와드리면 될까요?"
+                )
+            },
+            {
+                "role": "user", 
+                "content": (
+                    "송금을 하려고 해."
+                    "아들에게 100만원을 송금하려고 하는데 지금 즉시 이체해줄 수 있어?"
+                )
+            },
+        ],
+        [ #요약된 현재 정보와 과거 내역 정보(이름, 계좌, 송금내역은 이미 저장되어 있음.)들을 토대로 보이스피싱 위험도 분석
+            {
+                "role": "system",
+                "content": (
+                    "처음부터 끝까지 일관되게 한국어로 대답해줘."
+                    "너는 보이스피싱 탐지 전문가야. 사용자가 제공한 정보를 분석해 보이스피싱 여부와 대응 방안을 제시해."
+                    "정보를 분석해서 사용자가 보이스피싱에 노출된 위험도를 알려줘."
+                )
+            },
+            {
+                "role": "user", 
+                "content": (
+                    "철수는 영희를 친구로 생각한다. 철수는 10월 21일에 영희에게 100만원을 송금한 전적이 있으며"
+                    "10월 27일 현재 영희에게 100만원을 송금할 예정이다."
+                )
+            },
+        ],
+        [ #상대방과 통화한 내역 요약 진행 및 보이스피싱 위험도 분석 (이미 보이스피싱 사례가 학습되었다 가정)
+            {
+                "role": "system",
+                "content": (
+                    "처음부터 끝까지 일관되게 한국어로 대답해줘."
+                    "너는 보이스피싱 탐지 전문가야. 사용자가 상대방과 통화한 내역을 누가/무엇을/어떻게 하였다 라는 관계식으로 요약해줘."
+                    "그리고 요약한 내용을 분석해서 사용자가 보이스피싱에 노출되었는지 의심되는 여부와 그 근거를 3가지만 제시해줘."
+                )
+            },
+            {
+                "role": "user",
+                "content": (
+                    "택배 회사에서 하서휘에게 배송 사고가 발생했다고 연락해 본인 인증이 필요하다며 주민등록번호와 계좌 정보를 요청한다. "
+                    "이후 계좌에서 의심 거래가 발생했다며 경찰청 수사관과 연결해 준다. "
+                    "수사관은 자산 보호를 위해 지정된 계좌로 돈을 옮기라고 지시하고, 하서휘는 안내에 따라 돈을 이체한다.")
+            }
+        ]
+    ] 
+    # 얼마나 유용한 정보를 추출해 요약할 수 있는지 확인해야. 3초내로 user에게 답을 return할 수 있어야. csr, tts 기능 투입해 생성한 파일(통화 녹음 파일, 라마 대답 생성 파일) 가져오고 내보낼 수 있어야.
+    # 디코딩 전략으로 최적화 시도.
+
+    # 배치 입력 텍스트 준비
+    batch_size = 3
+    max_seq_len = 8192
+
+    # 1 2 4 8 10 12 14 16 ...
+
+    filtered_converstaion = conversation[:batch_size]
+
+    texts = [
+        tokenizer.apply_chat_template(conv, add_generation_prompt=True, tokenize=False)
+        for conv in filtered_converstaion
+    ]
+    assert len(texts) == batch_size
+    inputs = tokenizer(texts, return_tensors="pt", padding=True)
+
+    # 배치스트리밍을 위한 스트리머 준비
+    compiled_model = get_or_compile_model("prefix", model_id, batch_size, max_seq_len)
+
+    streamer = BatchTextIteratorStreamer(
+        tokenizer=tokenizer,
+        batch_size=batch_size,
+        skip_special_tokens=False,  # skip 이 True 면 계속 억지로 생성
+        skip_prompt=False,  # input 으로 주는 문장도 리턴값에 포함할지 말지.
+    )
+
+    # 문장 생성 (배치 생성)
+    generation_kwargs = dict(
+        input_ids=inputs["input_ids"],  # 입력 데이터 추가
+        attention_mask=inputs["attention_mask"],  # attention mask 추가
+        streamer=streamer,
+        do_sample=True,  # 샘플링 활성화
+        temperature=1.0,  # 샘플링 매개변수
+        top_p=0.9,  # 샘플링 매개변수
+        max_length=max_seq_len,
+    )
+
+    # 성능 측정 추가
+    start_time = time.time()
+    total_tokens = 0  # 생성된 토큰 개수
+
+    # 생성 스레드 시작
+    thread = Thread(target=compiled_model.generate, kwargs=generation_kwargs)
+    thread.start()
+
+    # 단어가 생성되어 토큰화되는 즉시 가져오기
+    # batchindex2output: Dict[int, str] = {} # 코딩 쉽게하기 위한 힌트
+    batchindex2output = {}
+    for i in range(batch_size):
+        batchindex2output[i] = ""
+
+    for new_text in streamer:
+        for i in range(batch_size):
+            print(new_text[i], end="", flush=True)
+            batchindex2output[i] += new_text[i]
+            total_tokens += len(tokenizer.encode(new_text[i], add_special_tokens=False))
+    print("\n")
+
+    for batch_index, output in batchindex2output.items():
+        print(f"{batch_index}: {output=}")
+
+    # 2 (A, B)
+    # A[0] output, B[0] output, A[1] output, B[1] output, -> 사람이 못읽음
+    # A[0] output, A[1] output, ...
+    # B[0] output, B[1] output, ...
+
+    # 스레드 완료 대기
+    thread.join()
+
+    # 성능 결과 출력
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    tps = total_tokens / elapsed_time
+
+    print(f"\n\nTime elapsed: {elapsed_time:.2f} seconds")
+    print(f"Total tokens generated: {total_tokens}")
+    print(f"Tokens per second (TPS): {tps:.2f} TPS")
+
+    # 20 TPS 기준 성능 비교
+    if tps >= 20:
+        print("Performance is within the acceptable range (>= 20 TPS).")
+    else:
+        print("Performance is below the acceptable range (< 20 TPS).")

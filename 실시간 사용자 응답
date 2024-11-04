@@ -1,0 +1,161 @@
+import json
+import os
+import time
+from threading import Thread
+from typing import Dict
+from transformers import AutoTokenizer
+from optimum.rbln import BatchTextIteratorStreamer, RBLNLlamaForCausalLM
+
+# 모델 설정
+model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
+model_save_dir = "rbln-Llama-3-8B-Instruct"
+batch_size = 3  # 배치 크기
+max_seq_len = 8192
+tp = 4  # 텐서 병렬 처리
+
+# 사용자 대화 이력과 배치 입력 관리
+user_conversations = {}  # 사용자별 대화 이력을 저장
+batch_inputs = []  # 배치 입력을 저장
+
+def get_or_compile_model(model_save_dir_prefix: str, model_id: str, batch_size: int, max_seq_len: int, tp: int = 4):
+    model_save_dir = f"{model_save_dir_prefix}.model_id={model_id}.batch_size={batch_size}.max_seq_len={max_seq_len}"
+
+    if not os.path.exists(model_save_dir):  # 모델이 없으면 컴파일
+        compiled_model = RBLNLlamaForCausalLM.from_pretrained(
+            model_id=model_id,
+            export=True,
+            rbln_batch_size=batch_size,
+            rbln_max_seq_len=max_seq_len,
+            rbln_tensor_parallel_size=tp,
+        )
+        compiled_model.save_pretrained(model_save_dir)
+
+    compiled_model = RBLNLlamaForCausalLM.from_pretrained(
+        model_id=model_save_dir,
+        export=False,
+    )
+    return compiled_model
+
+# 모델과 토크나이저 초기화
+compiled_model = get_or_compile_model("prefix", model_id, batch_size, max_seq_len)
+tokenizer = AutoTokenizer.from_pretrained(model_id, padding_side="left")
+tokenizer.pad_token = tokenizer.eos_token
+
+# 스트리밍을 위한 Streamer 설정
+streamer = BatchTextIteratorStreamer(
+    tokenizer=tokenizer,
+    batch_size=batch_size,
+    skip_special_tokens=False,
+    skip_prompt=False,
+)
+
+# 대화 시작 시 각 사용자에게 기본 system 메시지 추가
+def initialize_user_conversation(user_id):
+    if user_id not in user_conversations:
+        user_conversations[user_id] = [
+            {
+                "role": "system",
+                "content": "처음부터 끝까지 일관되게 한국어로 대답해줘. 너는 은행 업무 전문가야."
+            }
+        ]
+
+def generate_batch_responses():
+    if len(batch_inputs) < batch_size:
+        print("대기 중인 요청이 배치 크기에 도달하지 않았습니다. 더 많은 요청을 기다리는 중입니다.")
+        return
+
+    # 배치 크기만큼 대화 세션 가져오기
+    current_batch = batch_inputs[:batch_size]
+    del batch_inputs[:batch_size]
+
+    texts = []
+    for item in current_batch:
+        user_id = item["user_id"]
+        message = item["message"]
+
+        # 사용자별 대화 이력 업데이트
+        initialize_user_conversation(user_id)  # 사용자 대화 이력을 초기화 (system 메시지 포함)
+        user_conversations[user_id].append({"role": "user", "content": message})
+
+        # 최대 대화 이력 길이 초과 시 오래된 대화 삭제
+        max_history_length = 10
+        if len(user_conversations[user_id]) > max_history_length:
+            user_conversations[user_id].pop(0)
+
+        # 대화 이력을 포함하여 모델 입력 준비
+        user_history = user_conversations[user_id]
+        texts.append(tokenizer.apply_chat_template(user_history, add_generation_prompt=True, tokenize=False))
+
+    inputs = tokenizer(texts, return_tensors="pt", padding=True)
+
+    # 생성 설정
+    generation_kwargs = dict(
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+        streamer=streamer,
+        do_sample=True,
+        temperature=1.0,
+        top_p=0.9,
+        max_length=max_seq_len,
+    )
+
+    # 성능 측정 시작
+    start_time = time.time()
+    total_tokens = 0
+    batchindex2output = {i: "" for i in range(batch_size)}
+
+    # 생성 스레드 시작
+    thread = Thread(target=compiled_model.generate, kwargs=generation_kwargs)
+    thread.start()
+
+    # 배치 단위로 토큰화된 결과 가져오기
+    for new_text in streamer:
+        for i in range(batch_size):
+            batchindex2output[i] += new_text[i]
+            total_tokens += len(tokenizer.encode(new_text[i], add_special_tokens=False))
+
+    # 스레드 완료 대기
+    thread.join()
+
+    # 사용자별로 응답 저장 및 대화 이력에 추가
+    for i, response_content in batchindex2output.items():
+        user_id = current_batch[i]["user_id"]
+        user_conversations[user_id].append({"role": "assistant", "content": response_content})
+        print(f"Response for User {user_id}: {response_content}")
+
+    # 성능 측정 결과 출력
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    tps = total_tokens / elapsed_time
+    print(f"\n\nTime elapsed: {elapsed_time:.2f} seconds")
+    print(f"Total tokens generated: {total_tokens}")
+    print(f"Tokens per second (TPS): {tps:.2f} TPS")
+    if tps >= 20:
+        print("Performance is within the acceptable range (>= 20 TPS).")
+    else:
+        print("Performance is below the acceptable range (< 20 TPS).")
+
+# 사용자 입력 처리 함수
+def process_user_input(user_id, message, role="user"):
+    initialize_user_conversation(user_id)  # 사용자 대화 이력 초기화 (system 메시지 포함)
+    user_message = {"user_id": user_id, "message": message, "role": role}
+    batch_inputs.append(user_message)
+
+    # 배치 크기만큼 입력이 쌓이면 응답 생성
+    if len(batch_inputs) >= batch_size:
+        generate_batch_responses()
+    else:
+        print("Waiting for more inputs to fill the batch...")
+
+# 실시간으로 사용자 입력 받기
+print("대화형 모드에 진입했습니다. 종료하려면 'exit'를 입력하세요.")
+user_id = input("사용자 ID를 입력하세요: ")
+
+while True:
+    user_input = input(f"{user_id} 입력: ")
+    if user_input.lower() == "exit":
+        print("대화형 모드를 종료합니다.")
+        break
+
+    # 사용자 입력을 처리
+    process_user_input(user_id, user_input, role="user")

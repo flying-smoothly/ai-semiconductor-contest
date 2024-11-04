@@ -1,0 +1,134 @@
+import json
+import os
+import streamlit as st
+import time
+from threading import Thread
+from typing import Dict
+from transformers import AutoTokenizer
+from optimum.rbln import BatchTextIteratorStreamer, RBLNLlamaForCausalLM
+
+# 모델 설정
+model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
+model_save_dir_prefix = "rbln-Llama-3-8B-Instruct"
+batch_size = 3  # 배치 크기를 설정하여 여러 사용자 입력을 동시에 처리
+max_seq_len = 8192
+tp = 4  # Tensor parallelism 설정
+
+# Streamlit 초기 설정
+if "messages" not in st.session_state:
+    st.session_state["messages"] = []
+if "batch_inputs" not in st.session_state:
+    st.session_state["batch_inputs"] = []
+
+st.title("Chatbot powered by RBLN Llama with Batch Processing")
+
+def get_or_compile_model(model_save_dir_prefix: str, model_id: str, batch_size: int, max_seq_len: int, tp: int = 4):
+    model_save_dir = f"{model_save_dir_prefix}.model_id={model_id}.batch_size={batch_size}.max_seq_len={max_seq_len}"
+
+    # 파일이 존재하면 로드, 없으면 컴파일 후 저장
+    if not os.path.exists(model_save_dir):
+        compiled_model = RBLNLlamaForCausalLM.from_pretrained(
+            model_id=model_id,
+            export=True,
+            rbln_batch_size=batch_size,
+            rbln_max_seq_len=max_seq_len,
+            rbln_tensor_parallel_size=tp,
+        )
+        compiled_model.save_pretrained(model_save_dir)
+
+    compiled_model = RBLNLlamaForCausalLM.from_pretrained(
+        model_id=model_save_dir,
+        export=False,
+    )
+    return compiled_model
+
+# 모델과 토크나이저 초기화
+compiled_model = get_or_compile_model(model_save_dir_prefix, model_id, batch_size, max_seq_len)
+tokenizer = AutoTokenizer.from_pretrained(model_id, padding_side="left")
+tokenizer.pad_token = tokenizer.eos_token
+
+# 스트리밍을 위한 Streamer 설정
+streamer = BatchTextIteratorStreamer(
+    tokenizer=tokenizer,
+    batch_size=batch_size,
+    skip_special_tokens=False,
+    skip_prompt=False,
+)
+
+def generate_batch_responses():
+    if len(st.session_state["batch_inputs"]) < batch_size:
+        st.warning("대기 중인 요청이 배치 크기에 도달하지 않았습니다. 더 많은 요청을 기다리는 중입니다.")
+        return
+
+    # 배치 크기만큼 대화 세션 가져오기
+    batch_inputs = st.session_state["batch_inputs"][:batch_size]
+    st.session_state["batch_inputs"] = st.session_state["batch_inputs"][batch_size:]
+
+    # 각 대화 내용을 텍스트로 변환
+    texts = [
+        tokenizer.apply_chat_template(conv, add_generation_prompt=True, tokenize=False)
+        for conv in batch_inputs
+    ]
+    inputs = tokenizer(texts, return_tensors="pt", padding=True)
+
+    # 생성 설정
+    generation_kwargs = dict(
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+        streamer=streamer,
+        do_sample=True,
+        temperature=1.0,
+        top_p=0.9,
+        max_length=max_seq_len,
+    )
+
+    # 성능 측정 시작
+    start_time = time.time()
+    total_tokens = 0
+    batchindex2output = {i: "" for i in range(batch_size)}
+
+    # 생성 스레드 시작
+    thread = Thread(target=compiled_model.generate, kwargs=generation_kwargs)
+    thread.start()
+
+    # 배치 단위로 토큰화된 결과 가져오기
+    for new_text in streamer:
+        for i in range(batch_size):
+            batchindex2output[i] += new_text[i]
+            total_tokens += len(tokenizer.encode(new_text[i], add_special_tokens=False))
+
+    # 스레드 완료 대기
+    thread.join()
+
+    # 응답 저장
+    for i, response_content in batchindex2output.items():
+        st.session_state["messages"].append({"role": "assistant", "content": response_content})
+        st.write(f"Response {i + 1}: {response_content}")
+
+    # 성능 측정 결과 출력
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    tps = total_tokens / elapsed_time
+    print(f"\n\nTime elapsed: {elapsed_time:.2f} seconds")
+    print(f"Total tokens generated: {total_tokens}")
+    print(f"Tokens per second (TPS): {tps:.2f} TPS")
+    if tps >= 20:
+        print("Performance is within the acceptable range (>= 20 TPS).")
+    else:
+        print("Performance is below the acceptable range (< 20 TPS).")
+
+# 사용자 입력 처리
+if prompt := st.chat_input("Message the chatbot..."):
+    user_message = [{"role": "user", "content": prompt}]
+    st.session_state["batch_inputs"].append(user_message)
+    st.session_state["messages"].append({"role": "user", "content": prompt})
+
+    # 배치 크기만큼 입력이 쌓이면 응답 생성
+    if len(st.session_state["batch_inputs"]) >= batch_size:
+        generate_batch_responses()
+    else:
+        st.info("Waiting for more inputs to fill the batch...")
+
+# 대화 내역 출력
+for msg in st.session_state["messages"]:
+    st.chat_message(msg["role"]).write(msg["content"])

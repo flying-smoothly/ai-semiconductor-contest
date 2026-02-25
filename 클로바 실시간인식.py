@@ -2,9 +2,10 @@ import grpc
 import json
 import nest_pb2
 import nest_pb2_grpc
+import os
 
-AUDIO_PATH = "C:\\Users\\STORY\\Desktop\\ai 반도체\\청파동2가.pcm"   #인식할 오디오 파일이 위치한 경로를 입력해 주십시오. (16kHz, 1channel, 16 bits per sample의 PCM (헤더가 없는 raw wave) 형식)
-CLIENT_SECRET = "864d12b979e347538ef482e91995a474"
+AUDIO_PATH = os.getenv("CLOVA_AUDIO_PATH", "sample.pcm")   # 인식할 오디오 파일 경로
+CLIENT_SECRET = os.getenv("CLOVA_CLIENT_SECRET")
 
 def generate_requests(audio_path):
     # 초기 설정 요청: 음성 인식 설정
@@ -49,6 +50,8 @@ def extract_text_from_responses(responses):
     return ' '.join(texts)
 
 def main():
+    if not CLIENT_SECRET:
+        raise ValueError("환경변수 CLOVA_CLIENT_SECRET을 설정해 주세요.")
     # Clova Speech 서버에 대한 보안 gRPC 채널을 설정
     channel = grpc.secure_channel(
         "clovaspeech-gw.ncloud.com:50051",
@@ -90,3 +93,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+␍␊

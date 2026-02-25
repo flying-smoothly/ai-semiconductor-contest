@@ -1,16 +1,25 @@
 import requests
 import json
+import os
+
+
+DEFAULT_AUDIO_FILE = os.getenv('CLOVA_AUDIO_FILE', 'sample.m4a')
 
 
 class ClovaSpeechClient:
     # Clova Speech invoke URL (앱 등록 시 발급받은 Invoke URL)
-    invoke_url = 'https://clovaspeech-gw.ncloud.com/external/v1/9089/b304adc33719d6cddb96d6c4f1aa46628d927547b49b70c981c7fea953e0600a'
+    invoke_url = os.getenv('CLOVA_INVOKE_URL')
     # Clova Speech secret key (앱 등록 시 발급받은 Secret Key)
-    secret = 'cf453525306a4cf4b71763e123acb090'
+    secret = os.getenv('CLOVA_SECRET')
+
+
+    def _validate_config(self):
+        if not self.invoke_url or not self.secret:
+            raise ValueError('환경변수 CLOVA_INVOKE_URL과 CLOVA_SECRET을 설정해 주세요.')
 
     def req_upload(self, file, completion, callback=None, userdata=None, forbiddens=None, boostings=None,
                    wordAlignment=True, fullText=True, diarization=None, sed=None):
-        # 요청에 필요한 메타데이터 설정
+        self._validate_config()
         request_body = {
             'language': 'ko-KR',
             'completion': completion,
@@ -54,5 +63,6 @@ if __name__ == '__main__':
         print(result_json['text'])  # 'text' 필드만 출력
     else:
         print("No 'text' field found in response.")
+
 
 

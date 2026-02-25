@@ -1,14 +1,24 @@
 import requests
 import json
+import os
+
+
+DEFAULT_AUDIO_FILE = os.getenv('CLOVA_AUDIO_FILE', 'sample.m4a')
 
 
 class ClovaSpeechClient:
     # Clova Speech invoke URL (앱 등록 시 발급받은 Invoke URL)
-    invoke_url = 'https://clovaspeech-gw.ncloud.com/external/v1/9089/b304adc33719d6cddb96d6c4f1aa46628d927547b49b70c981c7fea953e0600a'
+    invoke_url = os.getenv('CLOVA_INVOKE_URL')
     # Clova Speech secret key (앱 등록 시 발급받은 Secret Key)
-    secret = 'cf453525306a4cf4b71763e123acb090'
+    secret = os.getenv('CLOVA_SECRET')
+
+
+    def _validate_config(self):
+        if not self.invoke_url or not self.secret:
+            raise ValueError('환경변수 CLOVA_INVOKE_URL과 CLOVA_SECRET을 설정해 주세요.')
 
     def req_url(self, url, completion, callback=None, userdata=None, forbiddens=None, boostings=None, wordAlignment=True, fullText=True, diarization=None, sed=None):
+        self._validate_config()
         request_body = {
             'url': url,
             'language': 'ko-KR',
@@ -33,6 +43,7 @@ class ClovaSpeechClient:
 
     def req_object_storage(self, data_key, completion, callback=None, userdata=None, forbiddens=None, boostings=None,
                            wordAlignment=True, fullText=True, diarization=None, sed=None):
+        self._validate_config()
         request_body = {
             'dataKey': data_key,
             'language': 'ko-KR',
@@ -57,6 +68,7 @@ class ClovaSpeechClient:
 
     def req_upload(self, file, completion, callback=None, userdata=None, forbiddens=None, boostings=None,
                    wordAlignment=True, fullText=True, diarization=None, sed=None):
+        self._validate_config()
         request_body = {
             'language': 'ko-KR',
             'completion': completion,
@@ -85,8 +97,10 @@ if __name__ == '__main__':
     # ClovaSpeechClient 객체 생성
     client = ClovaSpeechClient()
 
+    client._validate_config()
+
     # 파일 업로드 요청
-    result = client.req_upload(file=r"C:\Users\STORY\Desktop\ai_code\CSR\시끄러운 상황 + 작은 목소리.m4a", completion='sync')
+    result = client.req_upload(file=DEFAULT_AUDIO_FILE, completion='sync')
 
     # JSON 응답에서 'text'만 추출하여 출력
     result_json = result.json()
@@ -94,3 +108,4 @@ if __name__ == '__main__':
         print(result_json['text'])  # 'text' 필드만 출력
     else:
         print("No 'text' field found in response.")
+␍␊

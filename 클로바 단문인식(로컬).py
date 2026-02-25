@@ -53,9 +53,10 @@ class ClovaSpeechClient:
 if __name__ == '__main__':
     # ClovaSpeechClient 객체 생성
     client = ClovaSpeechClient()
+    client._validate_config()
 
     # 파일 업로드 요청
-    result = client.req_upload(file=r"C:\Users\STORY\Desktop\ai_code\CSR\시끄러운 상황 + 작은 목소리.m4a", completion='sync')
+    result = client.req_upload(file=DEFAULT_AUDIO_FILE, completion='sync')
 
     # JSON 응답에서 'text'만 추출하여 출력
     result_json = result.json()
@@ -63,6 +64,7 @@ if __name__ == '__main__':
         print(result_json['text'])  # 'text' 필드만 출력
     else:
         print("No 'text' field found in response.")
+
 
 
 
